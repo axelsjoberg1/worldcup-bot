@@ -3,6 +3,8 @@
 For each match shows:
   - Most likely exact final score (from Exact Score markets)
   - Win/Draw/Loss probabilities
+  - Total-goals Over/Under lines (also folded into the Poisson model so the
+    predicted score distribution matches the market's implied goal count)
 
 Run: python worldcup.py
      python worldcup.py --group A
@@ -58,15 +60,23 @@ def fetch_wc_events() -> list[dict]:
     return events
 
 
-def yes_price(market: dict) -> float:
+def _named_price(market: dict, target: str) -> float:
     oc = market.get("outcomes", "[]")
     pr = market.get("outcomePrices", "[]")
     if isinstance(oc, str): oc = json.loads(oc)
     if isinstance(pr, str): pr = json.loads(pr)
     for i, name in enumerate(oc):
-        if name.strip().lower() == "yes" and i < len(pr):
+        if name.strip().lower() == target and i < len(pr):
             return float(pr[i])
     return 0.0
+
+
+def yes_price(market: dict) -> float:
+    return _named_price(market, "yes")
+
+
+def over_price(market: dict) -> float:
+    return _named_price(market, "over")
 
 
 def canonical_title(title: str) -> str:
@@ -96,12 +106,16 @@ def group_events(events: list[dict]) -> dict[str, dict]:
         # Must look like "Team A vs. Team B": "vs" must appear within first 30 chars
         if not re.match(r"^.{1,30}\bvs\.?\s", raw_title):
             continue
-        # Exclude prop/side markets by colon, known prefix, or any suffix that isn't exact score
+        # Exclude prop/side markets by colon or known prefix.  Of the suffixed
+        # events we keep only "- Exact Score" (per-score prices) and
+        # "- More Markets" (the goal Over/Under lines).
         if ":" in raw_title or re.match(r"^world cup\b", raw_title, re.IGNORECASE):
             continue
         suffix_match = re.search(r"\s+-\s+(.+)$", raw_title, re.IGNORECASE)
-        if suffix_match and "exact score" not in suffix_match.group(1).lower():
-            continue
+        if suffix_match:
+            suffix = suffix_match.group(1).lower()
+            if "exact score" not in suffix and "more markets" not in suffix:
+                continue
 
         canon = canonical_title(raw_title)
         if canon not in grouped:
@@ -112,6 +126,7 @@ def group_events(events: list[dict]) -> dict[str, dict]:
                 "score_liquidity": 0.0,
                 "winner_markets": [],
                 "score_markets": [],
+                "goals_markets": [],
             }
 
         entry = grouped[canon]
@@ -120,8 +135,9 @@ def group_events(events: list[dict]) -> dict[str, dict]:
             entry["start_date"] = sd
         liq = float(ev.get("liquidity") or 0)
 
-        is_exact_score_event = "exact score" in raw_title.lower()
-        is_side_event        = any(kw in raw_title.lower() for kw in ("more markets", "halftime result"))
+        is_exact_score_event  = "exact score" in raw_title.lower()
+        is_more_markets_event = "more markets" in raw_title.lower()
+        is_side_event         = is_more_markets_event or "halftime result" in raw_title.lower()
 
         if not is_exact_score_event and not is_side_event:
             entry["result_liquidity"] += liq
@@ -136,6 +152,8 @@ def group_events(events: list[dict]) -> dict[str, dict]:
             if is_exact_score_event or label.lower().startswith("exact score:"):
                 entry["score_markets"].append(m)
                 entry["score_liquidity"] += float(m.get("volumeNum") or 0)
+            elif is_more_markets_event:
+                entry["goals_markets"].append(m)
             elif not is_side_event:
                 entry["winner_markets"].append(m)
 
@@ -162,6 +180,79 @@ def get_winner_probs(winner_markets: list[dict]) -> list[tuple[str, float]]:
             display = "Draw" if is_draw else label
             rows.append((display, p))
     return sorted(rows, key=lambda x: x[1], reverse=True)
+
+
+def _norm_team(s: str) -> str:
+    s = re.sub(r"\bBosnia-Herzegovina\b", "Bosnia and Herzegovina", s)
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def parse_goals_markets(
+    goals_markets: list[dict], home_team: str = "", away_team: str = ""
+) -> dict:
+    """Extract full-match Over/Under goal lines, per-team O/U lines and Both
+    Teams To Score from the '- More Markets' event.
+
+    Returns {
+        'total': [(line, p_over), ...],   # full match, line = 0.5, 1.5, ...
+        'home':  [(line, p_over), ...],   # home team total goals O/U
+        'away':  [(line, p_over), ...],   # away team total goals O/U
+        'btts':  p_yes | None,
+        'liquidity': float,               # combined volume of the goal markets used
+    }
+    Half-time / per-half markets are ignored (we model the full 90 minutes).
+    """
+    home_n, away_n = _norm_team(home_team), _norm_team(away_team)
+    total: dict[float, float] = {}
+    home:  dict[float, float] = {}
+    away:  dict[float, float] = {}
+    btts: float | None = None
+    liquidity = 0.0
+
+    for m in goals_markets:
+        label = m.get("groupItemTitle", "").strip()
+        low = label.lower()
+        if "half" in low:                      # skip 1st/2nd-half markets
+            continue
+        vol = float(m.get("volumeNum") or 0)
+
+        if low == "both teams to score":
+            p = yes_price(m)
+            if 0 < p < 1:
+                btts = p
+                liquidity += vol
+            continue
+
+        # Full-match total: e.g. "O/U 2.5"
+        mt = re.fullmatch(r"o/u\s+(\d+(?:\.\d+)?)", low)
+        if mt:
+            p = over_price(m)
+            if 0 < p < 1:
+                total[float(mt.group(1))] = p
+                liquidity += vol
+            continue
+
+        # Per-team total: e.g. "France O/U 1.5"
+        mteam = re.fullmatch(r"(.+?)\s+o/u\s+(\d+(?:\.\d+)?)", low)
+        if mteam:
+            p = over_price(m)
+            if not (0 < p < 1):
+                continue
+            who, line = mteam.group(1).strip(), float(mteam.group(2))
+            if who == home_n:
+                home[line] = p
+                liquidity += vol
+            elif who == away_n:
+                away[line] = p
+                liquidity += vol
+
+    return {
+        "total": sorted(total.items()),
+        "home":  sorted(home.items()),
+        "away":  sorted(away.items()),
+        "btts":  btts,
+        "liquidity": liquidity,
+    }
 
 
 def _parse_score(s: str) -> tuple[int, int] | None:
@@ -203,12 +294,65 @@ def _poisson_match_probs(la: float, lb: float) -> tuple[float, float, float]:
     return pw, pd, pl
 
 
-def _fit_poisson(p_win: float, p_draw: float, p_loss: float) -> tuple[float, float]:
-    """Grid-search for (λ_A, λ_B) that best reproduce the result market probabilities."""
+# Relative weight of each market family when fitting (λ_A, λ_B). The result
+# (win/draw/loss) market fixes the *difference* between the teams; the goal
+# Over/Under markets fix the *totals*. They are complementary, so combining
+# them pins down both parameters far better than the result market alone.
+_W_RESULT = 1.0   # per win/draw/loss term  (3 terms)
+_W_TOTAL  = 1.0   # per full-match O/U line
+_W_TEAM   = 0.7   # per per-team O/U line (partly redundant with the totals)
+_W_BTTS   = 0.5   # both-teams-to-score
+
+
+def _poisson_cdf(k: int, lam: float) -> float:
+    """P(N <= k) for N ~ Poisson(lam), k an integer >= 0."""
+    if lam <= 0:
+        return 1.0
+    term = math.exp(-lam)
+    cdf = term
+    for i in range(1, k + 1):
+        term *= lam / i
+        cdf += term
+    return cdf
+
+
+def _poisson_over(line: float, lam: float) -> float:
+    """P(N > line) for N ~ Poisson(lam); `line` is an x.5 goal line."""
+    return 1.0 - _poisson_cdf(int(math.floor(line)), lam)
+
+
+def _goals_error(la: float, lb: float, goals: dict | None) -> float:
+    """Weighted squared error of (λ_A, λ_B) against the goal Over/Under markets."""
+    if not goals:
+        return 0.0
+    err = 0.0
+    lt = la + lb
+    for line, p in goals.get("total", []):
+        err += _W_TOTAL * (_poisson_over(line, lt) - p) ** 2
+    for line, p in goals.get("home", []):
+        err += _W_TEAM * (_poisson_over(line, la) - p) ** 2
+    for line, p in goals.get("away", []):
+        err += _W_TEAM * (_poisson_over(line, lb) - p) ** 2
+    if goals.get("btts") is not None:
+        model = (1 - math.exp(-la)) * (1 - math.exp(-lb))
+        err += _W_BTTS * (model - goals["btts"]) ** 2
+    return err
+
+
+def _fit_poisson(
+    p_win: float, p_draw: float, p_loss: float, goals: dict | None = None
+) -> tuple[float, float]:
+    """Grid-search for (λ_A, λ_B) reproducing the result market and, when
+    available, the goal Over/Under markets."""
     t = p_win + p_draw + p_loss
     if t <= 0:
         return 1.25, 1.25
     pw, pd, pl = p_win / t, p_draw / t, p_loss / t
+
+    def err_at(la: float, lb: float) -> float:
+        cw, cd, cl = _poisson_match_probs(la, lb)
+        e = _W_RESULT * ((cw - pw) ** 2 + (cd - pd) ** 2 + (cl - pl) ** 2)
+        return e + _goals_error(la, lb, goals)
 
     best_err = float("inf")
     best_la = best_lb = 1.25
@@ -218,8 +362,7 @@ def _fit_poisson(p_win: float, p_draw: float, p_loss: float) -> tuple[float, flo
         la = i * 0.1
         for j in range(1, 41):
             lb = j * 0.1
-            cw, cd, cl = _poisson_match_probs(la, lb)
-            err = (cw - pw) ** 2 + (cd - pd) ** 2 + (cl - pl) ** 2
+            err = err_at(la, lb)
             if err < best_err:
                 best_err, best_la, best_lb = err, la, lb
 
@@ -228,21 +371,15 @@ def _fit_poisson(p_win: float, p_draw: float, p_loss: float) -> tuple[float, flo
         for dj in range(-10, 11):
             la = max(0.05, round(best_la + di * 0.01, 2))
             lb = max(0.05, round(best_lb + dj * 0.01, 2))
-            cw, cd, cl = _poisson_match_probs(la, lb)
-            err = (cw - pw) ** 2 + (cd - pd) ** 2 + (cl - pl) ** 2
+            err = err_at(la, lb)
             if err < best_err:
                 best_err, best_la, best_lb = err, la, lb
 
     return best_la, best_lb
 
 
-def _poisson_score_dist(result_probs: dict[str, float]) -> list[tuple[int, int, float]]:
-    """Score probability distribution from Poisson model fitted to result market."""
-    la, lb = _fit_poisson(
-        result_probs.get("home", 1 / 3),
-        result_probs.get("draw", 1 / 3),
-        result_probs.get("away", 1 / 3),
-    )
+def _score_dist_from_lambda(la: float, lb: float) -> list[tuple[int, int, float]]:
+    """Independent-Poisson score distribution for the given goal rates."""
     ea, eb = math.exp(-la), math.exp(-lb)
     pa, pb = [ea], [eb]
     for k in range(1, 8):
@@ -256,20 +393,97 @@ def _poisson_score_dist(result_probs: dict[str, float]) -> list[tuple[int, int, 
     ]
 
 
-def get_combined_scores(
+def _rank_scores(
+    raw: list[tuple[int, int, str, float]],
+    result_probs: dict[str, float],
+    top_n: int,
+) -> list[tuple[str, float, float]]:
+    """Calibrate raw (h, a, score, weight) tuples to the result-market outcome
+    proportions, normalize to probabilities, compute the expected points (EV)
+    of guessing each score, and return the top_n scores ranked by EV."""
+    if not raw:
+        return []
+
+    # Calibrate: rescale each outcome bucket to match result market proportions
+    raw_by: dict[str, float] = {"home": 0.0, "draw": 0.0, "away": 0.0}
+    for h, a, _, p in raw:
+        raw_by["home" if h > a else ("draw" if h == a else "away")] += p
+
+    calibrated: list[tuple[int, int, str, float]] = []
+    for h, a, score_str, p in raw:
+        outcome = "home" if h > a else ("draw" if h == a else "away")
+        scale = result_probs.get(outcome, 0.0) / raw_by[outcome] if raw_by[outcome] > 0 else 1.0
+        calibrated.append((h, a, score_str, p * scale))
+
+    total = sum(p for _, _, _, p in calibrated)
+    if total <= 0:
+        return []
+
+    score_probs = [(h, a, p / total) for h, a, _, p in calibrated]
+
+    result = []
+    for h, a, score_str, p in calibrated:
+        ev = sum(prob * _score_points(h, a, ah, aa) for ah, aa, prob in score_probs)
+        result.append((score_str, p / total, ev))
+
+    return sorted(result, key=lambda x: x[2], reverse=True)[:top_n]
+
+
+def _goals_display(goals: dict, la: float | None, lb: float | None) -> dict:
+    """Pair each market Over/Under probability with the fitted-model probability.
+    The model column is None when no Poisson fit was possible."""
+    def rows(items, lam):
+        return [
+            (line, p, (_poisson_over(line, lam) if lam is not None else None))
+            for line, p in items
+        ]
+
+    lt = (la + lb) if (la is not None and lb is not None) else None
+    btts = None
+    if goals.get("btts") is not None:
+        model = ((1 - math.exp(-la)) * (1 - math.exp(-lb))
+                 if (la is not None and lb is not None) else None)
+        btts = (goals["btts"], model)
+
+    return {
+        "total":     rows(goals.get("total", []), lt),
+        "home":      rows(goals.get("home", []), la),
+        "away":      rows(goals.get("away", []), lb),
+        "btts":      btts,
+        "lambda":    ((la, lb) if la is not None else None),
+        "liquidity": goals.get("liquidity", 0.0),
+    }
+
+
+def get_score_predictions(
     score_markets: list[dict],
     home_team: str = "",
     winner_rows: list | None = None,
     top_n: int = 5,
-) -> tuple[list[tuple[str, float, float]], bool]:
-    """Returns (scores, used_market_data).
+    goals_markets: list[dict] | None = None,
+    away_team: str = "",
+) -> dict:
+    """Compute BOTH the market-based and Poisson-based exact-score rankings.
 
-    Uses market prices only if every common score (0-0 through 3-3) has >= $200
-    trading volume.  If any one is missing or thin, falls back to the full
-    statistical distribution.  World Cup games are on neutral ground so the
-    home/away distinction in _SCORE_DIST is just label convention — the
-    distributions are symmetric.
+    Returns a dict:
+        {
+          "market":      [(score, prob, ev), ...],  # empty if no usable prices
+          "poisson":     [(score, prob, ev), ...],  # always available
+          "use_market":  bool,   # True when every key score is liquid enough
+          "min_key_vol": float,  # thinnest key-score volume (liquidity gauge)
+          "goals":       {...},  # Over/Under goal lines: market vs model
+        }
+
+    Both rankings are calibrated to the same result-market win/draw/loss
+    proportions, so the only difference is where the per-score shape comes from:
+    live Polymarket prices vs. a fitted independent-Poisson model.  The Poisson
+    model is fitted to the result market *and* the goal Over/Under markets
+    (full-match totals, per-team totals, both-teams-to-score), which are far
+    more liquid than the exact-score markets and pin down the goal totals.
+    World Cup games are on neutral ground, so home/away labels are convention.
     """
+    goals = parse_goals_markets(goals_markets or [], home_team, away_team)
+
     # Collect volumes and valid prices for all score markets
     score_volumes: dict[str, float] = {}
     score_prices: dict[str, float] = {}
@@ -287,11 +501,16 @@ def get_combined_scores(
         if 0 < p < 0.30:
             score_prices[score_str] = p
 
-    # All 9 key scores must have >= $100 traded volume to trust the market
+    # All key scores must clear the volume gate before we trust the market
     use_market = all(score_volumes.get(s, 0) >= _MARKET_MIN_VOL for s in _KEY_SCORES)
+    min_key_vol = min((score_volumes.get(s, 0) for s in _KEY_SCORES), default=0.0)
 
+    empty = {
+        "market": [], "poisson": [], "use_market": False,
+        "min_key_vol": min_key_vol, "goals": _goals_display(goals, None, None),
+    }
     if not winner_rows:
-        return [], False
+        return empty
 
     ht_lower = home_team.lower()
     rp: dict[str, float] = {}
@@ -305,49 +524,59 @@ def get_combined_scores(
             rp["away"] = p
 
     if not rp:
-        return [], False
+        return empty
 
     rt = sum(rp.values())
     result_probs = {k: v / rt for k, v in rp.items()}
 
-    if use_market:
-        raw: list[tuple[int, int, str, float]] = []
-        for score_str, p in score_prices.items():
-            parsed = _parse_score(score_str)
-            if parsed:
-                raw.append((parsed[0], parsed[1], score_str, p))
-    else:
-        raw = [
-            (h, a, f"{h}-{a}", p)
-            for h, a, p in _poisson_score_dist(result_probs)
-        ]
+    # Fit (λ_home, λ_away) to the result market AND the goal Over/Under markets
+    la, lb = _fit_poisson(
+        result_probs.get("home", 1 / 3),
+        result_probs.get("draw", 1 / 3),
+        result_probs.get("away", 1 / 3),
+        goals,
+    )
 
-    if not raw:
-        return [], False
+    # Market-based ranking (only if any prices survived the filter)
+    market_raw: list[tuple[int, int, str, float]] = []
+    for score_str, p in score_prices.items():
+        parsed = _parse_score(score_str)
+        if parsed:
+            market_raw.append((parsed[0], parsed[1], score_str, p))
+    market_rows = _rank_scores(market_raw, result_probs, top_n)
 
-    # Calibrate: rescale each outcome bucket to match result market proportions
-    raw_by: dict[str, float] = {"home": 0.0, "draw": 0.0, "away": 0.0}
-    for h, a, _, p in raw:
-        raw_by["home" if h > a else ("draw" if h == a else "away")] += p
+    # Poisson-based ranking (always available)
+    poisson_raw = [(h, a, f"{h}-{a}", p) for h, a, p in _score_dist_from_lambda(la, lb)]
+    poisson_rows = _rank_scores(poisson_raw, result_probs, top_n)
 
-    calibrated: list[tuple[int, int, str, float]] = []
-    for h, a, score_str, p in raw:
-        outcome = "home" if h > a else ("draw" if h == a else "away")
-        scale = result_probs.get(outcome, 0.0) / raw_by[outcome] if raw_by[outcome] > 0 else 1.0
-        calibrated.append((h, a, score_str, p * scale))
+    return {
+        "market": market_rows,
+        "poisson": poisson_rows,
+        "use_market": use_market,
+        "min_key_vol": min_key_vol,
+        "goals": _goals_display(goals, la, lb),
+    }
 
-    total = sum(p for _, _, _, p in calibrated)
-    if total <= 0:
-        return [], False
 
-    score_probs = [(h, a, p / total) for h, a, _, p in calibrated]
+def get_combined_scores(
+    score_markets: list[dict],
+    home_team: str = "",
+    winner_rows: list | None = None,
+    top_n: int = 5,
+) -> tuple[list[tuple[str, float, float]], bool]:
+    """Backward-compatible wrapper: returns (scores, used_market_data) for the
+    single recommended method — market when liquid, otherwise Poisson."""
+    pred = get_score_predictions(score_markets, home_team, winner_rows, top_n)
+    if pred["use_market"] and pred["market"]:
+        return pred["market"], True
+    return pred["poisson"], False
 
-    result = []
-    for h, a, score_str, p in calibrated:
-        ev = sum(prob * _score_points(h, a, ah, aa) for ah, aa, prob in score_probs)
-        result.append((score_str, p / total, ev))
 
-    return sorted(result, key=lambda x: x[2], reverse=True)[:top_n], use_market
+def _split_teams(title: str) -> tuple[str, str]:
+    parts = re.split(r"\s+vs\.?\s+", title, maxsplit=1)
+    home = parts[0].strip()
+    away = parts[1].strip() if len(parts) > 1 else ""
+    return home, away
 
 
 def print_match(entry: dict) -> None:
@@ -355,22 +584,43 @@ def print_match(entry: dict) -> None:
     result_liq       = entry.get("result_liquidity", 0.0)
     score_liq        = entry.get("score_liquidity", 0.0)
     winner_rows      = get_winner_probs(entry["winner_markets"])
-    home_team        = re.split(r"\s+vs\.?\s+", title, maxsplit=1)[0].strip()
-    score_rows, used_market = get_combined_scores(entry["score_markets"], home_team, winner_rows)
-    score_label = " [market]" if used_market else " [poisson]"
+    home_team, away_team = _split_teams(title)
+    pred             = get_score_predictions(
+        entry["score_markets"], home_team, winner_rows,
+        goals_markets=entry.get("goals_markets"), away_team=away_team,
+    )
+
+    market_rows  = pred["market"]
+    poisson_rows = pred["poisson"]
+    liquid       = pred["use_market"]
 
     start = entry.get("start_date", "")[:10] if entry.get("start_date") else ""
     print(f"\n  {title}" + (f"  [{start}]" if start else ""))
-    print(f"  Liquidity:  result ${result_liq:,.0f}  |  exact score ${score_liq:,.0f}")
 
-    if score_rows:
-        top_score, top_p, top_ev = score_rows[0]
-        print(f"  Best guess:   {top_score}  ({top_p*100:.1f}%  EV {top_ev:.2f}p){score_label}")
-        if len(score_rows) > 1:
-            others = "  |  ".join(f"{s} {p*100:.1f}% EV{ev:.2f}" for s, p, ev in score_rows[1:])
-            print(f"  Other scores: {others}")
+    liq_flag = "[OK  market liquid]" if liquid else "[!]  LOW liquidity -> rely on Poisson"
+    print(f"  Liquidity:  result ${result_liq:,.0f}  |  exact score ${score_liq:,.0f}   {liq_flag}")
+
+    def fmt_rows(rows):
+        return "  |  ".join(f"{s} EV{ev:.2f} ({p*100:.1f}%)" for s, p, ev in rows)
+
+    # Recommendation: market when it's liquid, otherwise the Poisson model
+    if liquid and market_rows:
+        rec_rows, rec_name = market_rows, "MARKET "
     else:
-        print(f"  Best guess:   (no prediction available)")
+        rec_rows, rec_name = poisson_rows, "POISSON"
+
+    if rec_rows:
+        top_score, top_p, top_ev = rec_rows[0]
+        print(f"  Recommend [{rec_name}]:  {top_score}  (EV {top_ev:.2f}p, {top_p*100:.1f}%)")
+    else:
+        print(f"  Recommend:  (no prediction available)")
+
+    if market_rows:
+        print(f"    Market:   {fmt_rows(market_rows)}")
+    else:
+        print(f"    Market:   (thin / no usable prices)")
+    if poisson_rows:
+        print(f"    Poisson:  {fmt_rows(poisson_rows)}")
 
     if winner_rows:
         parts = "  |  ".join(
@@ -378,6 +628,14 @@ def print_match(entry: dict) -> None:
             for i, (name, p) in enumerate(winner_rows)
         )
         print(f"  Result:            {parts}")
+
+    goals = pred.get("goals", {})
+    total = goals.get("total", [])
+    if total:
+        cells = "  ".join(f"O{line:g} {mkt*100:.0f}%" for line, mkt, _ in total)
+        print(f"  Total goals (mkt): {cells}")
+        if goals.get("btts"):
+            print(f"  Both teams score:  {goals['btts'][0]*100:.0f}%")
 
 
 

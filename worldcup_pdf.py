@@ -20,19 +20,23 @@ from worldcup import (
     fetch_wc_events,
     group_events,
     get_winner_probs,
-    get_combined_scores,
+    get_score_predictions,
     canonical_title,
 )
 
 
 # ── Colours ──────────────────────────────────────────────────────────────────
-GREEN      = colors.HexColor("#1a7a4a")
-LIGHT_GREEN= colors.HexColor("#e8f5ee")
-DARK_GREY  = colors.HexColor("#333333")
-MID_GREY   = colors.HexColor("#777777")
-LIGHT_GREY = colors.HexColor("#f4f4f4")
-GOLD       = colors.HexColor("#c8a400")
-WHITE      = colors.white
+GREEN       = colors.HexColor("#1a7a4a")
+LIGHT_GREEN = colors.HexColor("#e8f5ee")
+GREEN_BORDER= colors.HexColor("#c8ddd0")
+ORANGE      = colors.HexColor("#b35c00")
+LIGHT_ORANGE= colors.HexColor("#fdf1e3")
+ORANGE_BORDER=colors.HexColor("#eccfa6")
+DARK_GREY   = colors.HexColor("#333333")
+MID_GREY    = colors.HexColor("#777777")
+LIGHT_GREY  = colors.HexColor("#f4f4f4")
+GOLD        = colors.HexColor("#c8a400")
+WHITE       = colors.white
 
 
 def build_styles():
@@ -76,23 +80,39 @@ def build_match_table(entry: dict, styles: dict) -> Table:
     result_liq  = entry.get("result_liquidity", 0.0)
     score_liq   = entry.get("score_liquidity", 0.0)
     winner_rows = get_winner_probs(entry["winner_markets"])
-    home_team   = re.split(r"\s+vs\.?\s+", title, maxsplit=1)[0].strip()
-    score_rows, used_market = get_combined_scores(entry["score_markets"], home_team, winner_rows)
-    stat_model = not used_market
+    parts_t     = re.split(r"\s+vs\.?\s+", title, maxsplit=1)
+    home_team   = parts_t[0].strip()
+    away_team   = parts_t[1].strip() if len(parts_t) > 1 else ""
+    pred        = get_score_predictions(
+        entry["score_markets"], home_team, winner_rows,
+        goals_markets=entry.get("goals_markets"), away_team=away_team,
+    )
 
-    # ── Left cell: match title + best guess ──────────────────────────────────
+    market_rows  = pred["market"]
+    poisson_rows = pred["poisson"]
+    liquid       = pred["use_market"]
+
+    # Recommendation: trust the market when it's liquid, otherwise the model
+    if liquid and market_rows:
+        rec_rows, rec_name, rec_color = market_rows, "market data", "#1a7a4a"
+    else:
+        rec_rows, rec_name, rec_color = poisson_rows, "Poisson model", "#b35c00"
+
+    def fmt_scores(rows):
+        return "  ·  ".join(
+            f"{s} <font color='#c8a400'>EV{ev:.2f}</font> ({p*100:.1f}%)"
+            for s, p, ev in rows
+        )
+
+    # ── Left cell: match title + recommendation + both methods ───────────────
     start = entry.get("start_date", "")[:10] if entry.get("start_date") else ""
     title_str = f'{title}  <font size="8" color="#777777">{start}</font>' if start else title
     left = [Paragraph(title_str, styles["match_title"])]
 
-    if score_rows:
-        top_score, top_p, top_ev = score_rows[0]
-        if stat_model:
-            label_text = 'Best guess <font color="#b35c00">— Poisson model</font>'
-        else:
-            label_text = 'Best guess <font color="#1a7a4a">— market data</font>'
+    if rec_rows:
+        top_score, top_p, top_ev = rec_rows[0]
         left.append(Paragraph(
-            f'<font size="7">{label_text}</font>',
+            f'<font size="7">Recommended <font color="{rec_color}">— {rec_name}</font></font>',
             styles["label"]
         ))
         left.append(Paragraph(
@@ -100,16 +120,45 @@ def build_match_table(entry: dict, styles: dict) -> Table:
             f'<font size="8" color="#777777">({top_p*100:.1f}%)</font>',
             styles["score_best"]
         ))
-        if len(score_rows) > 1:
-            others_str = "  ·  ".join(
-                f"{s} <font color='#c8a400'>EV{ev:.2f}</font> ({p*100:.1f}%)"
-                for s, p, ev in score_rows[1:]
-            )
-            left.append(Paragraph(others_str, styles["score_others"]))
     else:
         left.append(Paragraph("No Exact Score market", styles["no_score"]))
 
-    # ── Right cell: result probabilities + liquidity ─────────────────────────
+    left.append(Spacer(1, 2))
+    if market_rows:
+        left.append(Paragraph(
+            f"<font color='#1a7a4a'><b>Market:</b></font>&nbsp; {fmt_scores(market_rows)}",
+            styles["score_others"]
+        ))
+    else:
+        left.append(Paragraph(
+            "<font color='#1a7a4a'><b>Market:</b></font>&nbsp; "
+            "<font color='#999999'>thin / no usable prices</font>",
+            styles["score_others"]
+        ))
+    if poisson_rows:
+        left.append(Paragraph(
+            f"<font color='#b35c00'><b>Poisson:</b></font>&nbsp; {fmt_scores(poisson_rows)}",
+            styles["score_others"]
+        ))
+
+    # ── Total-goals Over/Under (market price, with fitted-model check) ────────
+    goals = pred.get("goals", {})
+    total = goals.get("total", [])
+    if total:
+        cells = "  ·  ".join(
+            f"O{line:g} {mkt*100:.0f}%"
+            + (f"<font color='#999999'>/{model*100:.0f}</font>" if model is not None else "")
+            for line, mkt, model in total
+        )
+        btts = goals.get("btts")
+        btts_str = f"&nbsp;&nbsp;|&nbsp;&nbsp;BTTS {btts[0]*100:.0f}%" if btts else ""
+        left.append(Spacer(1, 2))
+        left.append(Paragraph(
+            f"<font color='#444444'><b>Goals:</b></font>&nbsp; {cells}{btts_str}",
+            styles["score_others"]
+        ))
+
+    # ── Right cell: result probabilities + liquidity flag ────────────────────
     right = []
     if winner_rows:
         parts = []
@@ -122,18 +171,27 @@ def build_match_table(entry: dict, styles: dict) -> Table:
         right.append(Paragraph("  |  ".join(parts), styles["result"]))
 
     right.append(Spacer(1, 2))
+    if liquid:
+        right.append(Paragraph(
+            "<font color='#1a7a4a'><b>market liquid</b></font>", styles["liq"]))
+    else:
+        right.append(Paragraph(
+            "<font color='#b35c00'><b>LOW LIQUIDITY — use Poisson</b></font>", styles["liq"]))
     right.append(Paragraph(
         f'Result {fmt_liq(result_liq)}  ·  Score {fmt_liq(score_liq)}',
         styles["liq"]
     ))
 
+    bg     = LIGHT_GREEN if liquid else LIGHT_ORANGE
+    border = GREEN_BORDER if liquid else ORANGE_BORDER
+
     col_widths = [115*mm, 55*mm]
     t = Table([[left, right]], colWidths=col_widths)
     t.setStyle(TableStyle([
         ("VALIGN",      (0, 0), (-1, -1), "TOP"),
-        ("BACKGROUND",  (0, 0), (-1, -1), LIGHT_GREEN),
+        ("BACKGROUND",  (0, 0), (-1, -1), bg),
         ("ROUNDEDCORNERS", [4]),
-        ("BOX",         (0, 0), (-1, -1), 0.5, colors.HexColor("#c8ddd0")),
+        ("BOX",         (0, 0), (-1, -1), 0.5, border),
         ("LEFTPADDING",  (0, 0), (0, -1), 8),
         ("RIGHTPADDING", (1, 0), (1, -1), 8),
         ("TOPPADDING",   (0, 0), (-1, -1), 7),
@@ -196,8 +254,12 @@ def generate_pdf(output_path: str, group_filter: str | None = None) -> None:
     story.append(HRFlowable(width="100%", thickness=0.5, color=MID_GREY))
     story.append(Spacer(1, 2*mm))
     story.append(Paragraph(
-        "Prices from Polymarket prediction markets. EV calculated using game rules: "
-        "6p exact · 4p right outcome + one team correct · 3p right outcome · 1p wrong outcome + one team correct.",
+        "Each card shows both methods: <font color='#1a7a4a'><b>Market</b></font> = live Polymarket exact-score prices · "
+        "<font color='#b35c00'><b>Poisson</b></font> = model fitted to the win/draw/loss market. "
+        "Green cards are liquid (trust the market); <font color='#b35c00'>orange = low liquidity, rely on Poisson</font>. "
+        "<font color='#444444'><b>Goals</b></font> = market Over/Under goal lines (BTTS = both teams to score); the Poisson model "
+        "is fitted to these totals too, so its score shape matches the implied goal count. "
+        "EV uses game rules: 6p exact · 4p right outcome + one team correct · 3p right outcome · 1p wrong outcome + one team correct.",
         styles["footer"]
     ))
 
