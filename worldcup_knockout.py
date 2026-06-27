@@ -126,7 +126,7 @@ def derive_advance_prob(rp: dict) -> float:
     return pw + pd * et_share
 
 
-def extract_advance_prob(entry: dict, home: str, away: str) -> float | None:
+def extract_advance_prob(entry: dict, home: str, away: str) -> tuple[float, float] | None:
     """Read Polymarket's direct 'Team to Advance' market for this knockout tie.
 
     Confirmed structure (e.g. South Africa vs. Canada, R32): it is a single
@@ -134,16 +134,17 @@ def extract_advance_prob(entry: dict, home: str, away: str) -> float | None:
     '- More Markets' event — which group_events() collects into goals_markets.
     Prices already include extra time / penalties (e.g. SA 0.28 / Canada 0.73).
 
-    Returns P(home advances), normalised for the over-round, or None when the
-    market is absent / untraded / can't be mapped to the two teams — in which
-    case the caller falls back to derive_advance_prob().
+    Returns (P(home advances), traded volume), normalised for the over-round, or
+    None when the market is absent / untraded / can't be mapped to the two teams
+    — in which case the caller falls back to derive_advance_prob().
     """
     pools = list(entry.get("goals_markets", [])) + list(entry.get("winner_markets", []))
     for m in pools:
         label = m.get("groupItemTitle", "").strip().lower()
         if "advance" not in label and "qualif" not in label:
             continue
-        if float(m.get("volumeNum") or 0) < ADV_MIN_VOL:   # untraded -> derive instead
+        vol = float(m.get("volumeNum") or 0)
+        if vol < ADV_MIN_VOL:                       # untraded -> derive instead
             continue
         oc = m.get("outcomes", "[]")
         pr = m.get("outcomePrices", "[]")
@@ -164,7 +165,7 @@ def extract_advance_prob(entry: dict, home: str, away: str) -> float | None:
         p_home, p_away = prices[hi], prices[1 - hi]
         total = p_home + p_away
         if total > 0:
-            return p_home / total
+            return p_home / total, vol
     return None
 
 
@@ -216,22 +217,29 @@ def knockout_pick(entry: dict) -> dict:
         top_n=TOP_N_FETCH, goals_markets=entry.get("goals_markets"), away_team=away,
     )
 
-    # P(home advances): compute BOTH so we can show them side by side. Prefer the
-    # traded 'Team to Advance' market; fall back to the derived estimate when that
-    # market is absent or untraded (low volume).
+    # Advance probability per view:
+    #   Market view  = traded 'Team to Advance' market, derived as fallback.
+    #   Poisson view = always the derived estimate.
     adv_derived = derive_advance_prob(rp) if rp else None
-    adv_market  = extract_advance_prob(entry, home, away) if rp else None
-    if adv_market is not None:
-        p_home_adv, src = adv_market, "market"
-    else:
-        p_home_adv, src = adv_derived, "derived"
+    adv_market, adv_liq = None, 0.0
+    if rp:
+        res = extract_advance_prob(entry, home, away)
+        if res is not None:
+            adv_market, adv_liq = res
+    market_adv  = adv_market if adv_market is not None else adv_derived
+    market_src  = "market" if adv_market is not None else "derived"
+    poisson_adv = adv_derived
 
     liquid = pred["use_market"]
-    market_rows  = _augment_rows(pred["market"],  p_home_adv, home, away) if p_home_adv is not None else []
-    poisson_rows = _augment_rows(pred["poisson"], p_home_adv, home, away) if p_home_adv is not None else []
+    market_rows  = _augment_rows(pred["market"],  market_adv,  home, away) if market_adv  is not None else []
+    poisson_rows = _augment_rows(pred["poisson"], poisson_adv, home, away) if poisson_adv is not None else []
 
-    rec_rows = market_rows if (liquid and market_rows) else poisson_rows
-    rec_name = "market" if (liquid and market_rows) else "poisson"
+    # The recommendation follows its view's advance source: market when the
+    # exact-score market is liquid, otherwise Poisson (with derived advance).
+    if liquid and market_rows:
+        rec_rows, rec_name, p_home_adv, src = market_rows, "market", market_adv, market_src
+    else:
+        rec_rows, rec_name, p_home_adv, src = poisson_rows, "poisson", poisson_adv, "derived"
 
     # Best pure-1X2 tip (for comparison): 3p * P(outcome) + 3p advance bonus
     one_x_two = None
@@ -249,6 +257,7 @@ def knockout_pick(entry: dict) -> dict:
         "winner_rows": winner_rows, "result_probs": rp,
         "p_home_adv": p_home_adv, "adv_source": src,
         "adv_market": adv_market, "adv_derived": adv_derived,
+        "adv_liq": adv_liq, "market_adv_source": market_src,
         "liquid": liquid,
         "market_rows": market_rows, "poisson_rows": poisson_rows,
         "rec_rows": rec_rows, "rec_name": rec_name,
@@ -291,7 +300,8 @@ def print_ko_match(p: dict) -> None:
     pick = p["rec_rows"][0]["advance"] if p["rec_rows"] else (p["home"] if pa >= 0.5 else p["away"])
     hm = " <--" if pick == p["home"] else ""
     am = " <--" if pick == p["away"] else ""
-    print(f"  Advance ({p['adv_source']}): {p['home']} {pa*100:.0f}%{hm}  |  {p['away']} {(1-pa)*100:.0f}%{am}")
+    adv_liq_txt = f", ${p['adv_liq']:,.0f} vol" if p["adv_market"] is not None else ""
+    print(f"  Advance ({p['adv_source']}{adv_liq_txt}): {p['home']} {pa*100:.0f}%{hm}  |  {p['away']} {(1-pa)*100:.0f}%{am}")
 
     if p["rec_rows"]:
         r = p["rec_rows"][0]
@@ -307,11 +317,11 @@ def print_ko_match(p: dict) -> None:
             f"{r['score']} {r['total_ev']:.2f}p ({r['prob']*100:.1f}%)" for r in rows[:TOP_N_DISPLAY]
         )
     if p["market_rows"]:
-        print(f"     Market:  {fmt(p['market_rows'])}")
+        print(f"     Market  (incl. {p['market_adv_source']} adv):  {fmt(p['market_rows'])}")
     else:
-        print(f"     Market:  (thin / no usable prices)")
+        print(f"     Market  (incl. adv):  (thin / no usable prices)")
     if p["poisson_rows"]:
-        print(f"     Poisson: {fmt(p['poisson_rows'])}")
+        print(f"     Poisson (incl. derived adv):  {fmt(p['poisson_rows'])}")
 
     if p["winner_rows"]:
         parts = "  |  ".join(
@@ -363,7 +373,7 @@ def explain_match(p: dict) -> None:
         print(f"     derived:  {home} {ad*100:.0f}%  |  {away} {(1-ad)*100:.0f}%"
               f"   [{rp['home']:.2f} + {rp['draw']:.2f}*{rp['home']:.2f}/({rp['home']:.2f}+{rp['away']:.2f})]")
     if am is not None:
-        print(f"     market:   {home} {am*100:.0f}%  |  {away} {(1-am)*100:.0f}%   (traded ≥ ${ADV_MIN_VOL} vol)")
+        print(f"     market:   {home} {am*100:.0f}%  |  {away} {(1-am)*100:.0f}%   (traded ${p['adv_liq']:,.0f} vol)")
     else:
         print(f"     market:   not traded / too thin  ->  falling back to derived")
     pa = p["p_home_adv"]
@@ -437,16 +447,16 @@ def generate_pdf(picks: list[dict], output_path: str) -> None:
         left.append(Spacer(1, 2))
         if p["market_rows"]:
             left.append(Paragraph(
-                f"<font color='#1a7a4a'><b>Market:</b></font>&nbsp; {fmt_scores(p['market_rows'])}",
-                styles["score_others"]))
+                f"<font color='#1a7a4a'><b>Market (incl. {p['market_adv_source']} adv):</b></font>&nbsp; "
+                f"{fmt_scores(p['market_rows'])}", styles["score_others"]))
         else:
             left.append(Paragraph(
-                "<font color='#1a7a4a'><b>Market:</b></font>&nbsp; "
+                "<font color='#1a7a4a'><b>Market (incl. adv):</b></font>&nbsp; "
                 "<font color='#999999'>thin / no usable prices</font>", styles["score_others"]))
         if p["poisson_rows"]:
             left.append(Paragraph(
-                f"<font color='#b35c00'><b>Poisson:</b></font>&nbsp; {fmt_scores(p['poisson_rows'])}",
-                styles["score_others"]))
+                f"<font color='#b35c00'><b>Poisson (incl. derived adv):</b></font>&nbsp; "
+                f"{fmt_scores(p['poisson_rows'])}", styles["score_others"]))
 
         goals = p["goals"].get("total", [])
         if goals:
@@ -475,8 +485,10 @@ def generate_pdf(picks: list[dict], output_path: str) -> None:
             right.append(Spacer(1, 2))
             right.append(Paragraph("90': " + "  |  ".join(parts), styles["result"]))
         right.append(Spacer(1, 2))
-        right.append(Paragraph(
-            f'Result {fmt_liq(p["result_liq"])} · Score {fmt_liq(p["score_liq"])}', styles["liq"]))
+        liq_line = f'Result {fmt_liq(p["result_liq"])} · Score {fmt_liq(p["score_liq"])}'
+        if p["adv_market"] is not None:
+            liq_line += f' · Advance {fmt_liq(p["adv_liq"])}'
+        right.append(Paragraph(liq_line, styles["liq"]))
 
         bg = LIGHT_GREEN if p["liquid"] else LIGHT_ORANGE
         border = GREEN_BORDER if p["liquid"] else ORANGE_BORDER
