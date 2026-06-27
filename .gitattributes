@@ -1,0 +1,8 @@
+# Normalise line endings for text; never touch binaries.
+*.py text eol=lf
+*.md text eol=lf
+
+# Binary files — disable any line-ending conversion (autocrlf would corrupt them).
+*.pdf binary
+*.png binary
+*.jpg binary
