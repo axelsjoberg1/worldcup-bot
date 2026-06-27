@@ -44,6 +44,7 @@ Run: python worldcup_knockout.py                     # report + PDF
 
 import sys
 import re
+import json
 import argparse
 from datetime import datetime
 
@@ -66,6 +67,9 @@ TOP_N_DISPLAY = 5
 # Pull this many scores from the engine so the best TOTAL-EV score is never
 # truncated before we add the advance bonus (poisson has <=64 scores).
 TOP_N_FETCH = 100
+# Minimum traded volume for a 'Team to Advance' market to be trusted; below this
+# it is treated as untraded and we fall back to the derived advance probability.
+ADV_MIN_VOL = 50
 
 
 # ── Result / advance probabilities ───────────────────────────────────────────
@@ -123,37 +127,44 @@ def derive_advance_prob(rp: dict) -> float:
 
 
 def extract_advance_prob(entry: dict, home: str, away: str) -> float | None:
-    """Best-effort: read a direct 'to advance' / 'to qualify' market for the
-    home team if Polymarket lists one for this match.
+    """Read Polymarket's direct 'Team to Advance' market for this knockout tie.
 
-    The knockout matchups are not on Polymarket until the group stage ends, so
-    the exact market shape is unconfirmed. We scan every market attached to the
-    match entry for a Yes-priced 'advance/qualify' market naming the home team,
-    and return None (falling back to derive_advance_prob) when nothing matches.
-    Revisit once real R32 markets exist to lock the label format.
+    Confirmed structure (e.g. South Africa vs. Canada, R32): it is a single
+    2-way market whose two outcomes are the team names, living inside the
+    '- More Markets' event — which group_events() collects into goals_markets.
+    Prices already include extra time / penalties (e.g. SA 0.28 / Canada 0.73).
+
+    Returns P(home advances), normalised for the over-round, or None when the
+    market is absent / untraded / can't be mapped to the two teams — in which
+    case the caller falls back to derive_advance_prob().
     """
-    from worldcup import yes_price  # local import; only needed here
-
-    hn, an = home.lower(), away.lower()
-    home_p = away_p = None
-    for m in entry.get("winner_markets", []):
-        label = m.get("groupItemTitle", "").lower()
-        if not any(k in label for k in ("advance", "qualif", "to win the tie", "progress")):
+    pools = list(entry.get("goals_markets", [])) + list(entry.get("winner_markets", []))
+    for m in pools:
+        label = m.get("groupItemTitle", "").strip().lower()
+        if "advance" not in label and "qualif" not in label:
             continue
-        p = yes_price(m)
-        if not (0 < p < 1):
+        if float(m.get("volumeNum") or 0) < ADV_MIN_VOL:   # untraded -> derive instead
             continue
-        if hn in label:
-            home_p = p
-        elif an in label:
-            away_p = p
-    if home_p is not None and away_p is not None:
-        total = home_p + away_p
-        return home_p / total if total > 0 else home_p
-    if home_p is not None:
-        return home_p
-    if away_p is not None:
-        return 1 - away_p
+        oc = m.get("outcomes", "[]")
+        pr = m.get("outcomePrices", "[]")
+        if isinstance(oc, str): oc = json.loads(oc)
+        if isinstance(pr, str): pr = json.loads(pr)
+        if len(oc) != 2 or len(pr) != 2:
+            continue
+        try:
+            prices = [float(x) for x in pr]
+        except (TypeError, ValueError):
+            continue
+        if not all(0 < x < 1 for x in prices):     # untraded / default market
+            continue
+        sims = [_team_similarity(name, home) for name in oc]
+        if max(sims) <= 0:                          # can't map outcomes -> teams
+            continue
+        hi = sims.index(max(sims))
+        p_home, p_away = prices[hi], prices[1 - hi]
+        total = p_home + p_away
+        if total > 0:
+            return p_home / total
     return None
 
 
@@ -205,15 +216,15 @@ def knockout_pick(entry: dict) -> dict:
         top_n=TOP_N_FETCH, goals_markets=entry.get("goals_markets"), away_team=away,
     )
 
-    # P(home advances): direct market if present, else derived from 90-min result
-    p_home_adv = None
-    src = "derived"
-    if rp:
-        direct = extract_advance_prob(entry, home, away)
-        if direct is not None:
-            p_home_adv, src = direct, "market"
-        else:
-            p_home_adv = derive_advance_prob(rp)
+    # P(home advances): compute BOTH so we can show them side by side. Prefer the
+    # traded 'Team to Advance' market; fall back to the derived estimate when that
+    # market is absent or untraded (low volume).
+    adv_derived = derive_advance_prob(rp) if rp else None
+    adv_market  = extract_advance_prob(entry, home, away) if rp else None
+    if adv_market is not None:
+        p_home_adv, src = adv_market, "market"
+    else:
+        p_home_adv, src = adv_derived, "derived"
 
     liquid = pred["use_market"]
     market_rows  = _augment_rows(pred["market"],  p_home_adv, home, away) if p_home_adv is not None else []
@@ -237,6 +248,7 @@ def knockout_pick(entry: dict) -> dict:
         "start": (entry.get("start_date") or "")[:10],
         "winner_rows": winner_rows, "result_probs": rp,
         "p_home_adv": p_home_adv, "adv_source": src,
+        "adv_market": adv_market, "adv_derived": adv_derived,
         "liquid": liquid,
         "market_rows": market_rows, "poisson_rows": poisson_rows,
         "rec_rows": rec_rows, "rec_name": rec_name,
@@ -276,7 +288,10 @@ def print_ko_match(p: dict) -> None:
         return
 
     pa = p["p_home_adv"]
-    print(f"  Advance ({p['adv_source']}): {p['home']} {pa*100:.0f}%  |  {p['away']} {(1-pa)*100:.0f}%")
+    pick = p["rec_rows"][0]["advance"] if p["rec_rows"] else (p["home"] if pa >= 0.5 else p["away"])
+    hm = " <--" if pick == p["home"] else ""
+    am = " <--" if pick == p["away"] else ""
+    print(f"  Advance ({p['adv_source']}): {p['home']} {pa*100:.0f}%{hm}  |  {p['away']} {(1-pa)*100:.0f}%{am}")
 
     if p["rec_rows"]:
         r = p["rec_rows"][0]
@@ -309,6 +324,61 @@ def print_ko_match(p: dict) -> None:
     if total:
         cells = "  ".join(f"O{line:g} {mkt*100:.0f}%" for line, mkt, _ in total)
         print(f"  Total goals (mkt): {cells}")
+
+
+def explain_match(p: dict) -> None:
+    """Print the full reasoning chain for one match, step by step."""
+    print("\n" + "=" * 66)
+    print(f"  {p['title']}" + (f"   [{p['start']}]" if p["start"] else ""))
+    print("=" * 66)
+
+    if p["p_home_adv"] is None:
+        print("  No result market — cannot model this match.")
+        return
+
+    home, away = p["home"], p["away"]
+
+    # STEP 1 — result market (1X2, 90 min)
+    print(f"\n  STEP 1 — Result market (1X2, 90 min)   [Result ${p['result_liq']:,.0f}]")
+    for n, pr in (p["winner_rows"] or []):
+        print(f"     {n:<26} {pr*100:5.1f}%")
+
+    # STEP 2 — Poisson model fitted to 1X2 + goal O/U
+    print(f"\n  STEP 2 — Poisson fit to the 1X2 + goal Over/Under markets")
+    lam = p["goals"].get("lambda")
+    if lam:
+        la, lb = lam
+        print(f"     lambda({home}) = {la:.2f}    lambda({away}) = {lb:.2f}    (expected goals {la+lb:.2f})")
+    g = p["goals"].get("total", [])
+    if g:
+        print("     goal lines used: " + "  ".join(f"O{l:g} {mkt*100:.0f}%" for l, mkt, _ in g))
+    print("     Poisson score distribution (top, before advance bonus):")
+    for r in sorted(p["poisson_rows"], key=lambda x: -x["prob"])[:8]:
+        print(f"       {r['score']:<5} {r['prob']*100:5.1f}%    score-EV {r['score_ev']:.2f}")
+
+    # STEP 3 — Team to Advance (market vs derived)
+    print(f"\n  STEP 3 — Team to Advance  (incl. extra time / penalties)")
+    rp, ad, am = p["result_probs"], p["adv_derived"], p["adv_market"]
+    if ad is not None:
+        print(f"     derived:  {home} {ad*100:.0f}%  |  {away} {(1-ad)*100:.0f}%"
+              f"   [{rp['home']:.2f} + {rp['draw']:.2f}*{rp['home']:.2f}/({rp['home']:.2f}+{rp['away']:.2f})]")
+    if am is not None:
+        print(f"     market:   {home} {am*100:.0f}%  |  {away} {(1-am)*100:.0f}%   (traded ≥ ${ADV_MIN_VOL} vol)")
+    else:
+        print(f"     market:   not traded / too thin  ->  falling back to derived")
+    pa = p["p_home_adv"]
+    print(f"     USING {p['adv_source'].upper()}:  {home} {pa*100:.0f}%  |  {away} {(1-pa)*100:.0f}%")
+
+    # STEP 4 — total EV ranking
+    print(f"\n  STEP 4 — Total EV = score-EV + 3 * P(advance for that outcome)")
+    print(f"     score shape: {p['rec_name'].upper()} "
+          f"({'exact-score market liquid' if p['liquid'] else 'exact-score market thin -> Poisson'})")
+    for r in p["rec_rows"][:TOP_N_DISPLAY]:
+        print(f"       {r['score']:<5} total {r['total_ev']:.2f} = score {r['score_ev']:.2f} "
+              f"+ adv {r['adv_bonus']:.2f}   -> {r['advance']} advances")
+    if p["rec_rows"]:
+        r = p["rec_rows"][0]
+        print(f"\n  >> TIP: {r['score']}  ->  {r['advance']} advances   ({r['total_ev']:.2f}p expected)")
 
 
 # ── PDF report ────────────────────────────────────────────────────────────────
@@ -385,12 +455,18 @@ def generate_pdf(picks: list[dict], output_path: str) -> None:
             left.append(Paragraph(
                 f"<font color='#444444'><b>Goals:</b></font>&nbsp; {cells}", styles["score_others"]))
 
-        # Right cell: advance probabilities + 90-min result + liquidity
+        # Right cell: advance probabilities + 90-min result + liquidity.
+        # Highlight the team the TIP backs to advance (not always the home side).
         pa = p["p_home_adv"]
+        home_cell = f'{p["home"]} {pa*100:.0f}%'
+        away_cell = f'{p["away"]} {(1-pa)*100:.0f}%'
+        if r["advance"] == p["home"]:
+            home_cell = f'<font color="#1a7a4a"><b>{home_cell}</b></font>'
+        else:
+            away_cell = f'<font color="#1a7a4a"><b>{away_cell}</b></font>'
         right = [Paragraph(
             f'<b>Advance</b> <font size="7" color="#777777">({p["adv_source"]})</font><br/>'
-            f'<font color="#1a7a4a"><b>{p["home"]} {pa*100:.0f}%</b></font> · '
-            f'{p["away"]} {(1-pa)*100:.0f}%',
+            f'{home_cell} · {away_cell}',
             styles["result"])]
         if p["winner_rows"]:
             parts = []
@@ -458,6 +534,9 @@ def main() -> None:
     ap.add_argument("--from", dest="from_date", default=DEFAULT_FROM,
                     help=f"Only matches on/after this date (YYYY-MM-DD, default {DEFAULT_FROM})")
     ap.add_argument("--out", default="worldcup_knockout.pdf", help="PDF output path")
+    ap.add_argument("--explain", nargs="?", const="", default=None,
+                    help="Print the full reasoning chain per match "
+                         "(optionally a team substring to filter, e.g. --explain canada)")
     args = ap.parse_args()
 
     print("=" * 62)
@@ -476,8 +555,15 @@ def main() -> None:
 
     print("-" * 62)
     picks = [knockout_pick(e) for e in matches]
-    for p in picks:
-        print_ko_match(p)
+    if args.explain is not None:
+        flt = args.explain.lower()
+        for p in picks:
+            if flt and flt not in p["title"].lower():
+                continue
+            explain_match(p)
+    else:
+        for p in picks:
+            print_ko_match(p)
 
     print("\n" + "=" * 62)
     generate_pdf(picks, args.out)
