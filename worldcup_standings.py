@@ -302,8 +302,9 @@ def main() -> None:
         "2nd": defaultdict(int),
         "3rd": defaultdict(int),
     }
-    # matchup_counts[round_idx][(teamA, teamB)] = times this matchup occurred
-    matchup_counts: list[dict[tuple[str, str], int]] = [defaultdict(int) for _ in range(6)]
+    # matchup_counts[round_idx][(teamA, teamB)] = times this matchup occurred.
+    # Grown on demand: round count varies with how many teams advance.
+    matchup_counts: list[dict[tuple[str, str], int]] = []
 
     for _ in range(args.sims):
         c, r, t, rounds = sim_tournament(groups, match_probs, strengths)
@@ -311,6 +312,8 @@ def main() -> None:
         counts["2nd"][r] += 1
         counts["3rd"][t] += 1
         for ri, matchups in enumerate(rounds):
+            while ri >= len(matchup_counts):
+                matchup_counts.append(defaultdict(int))
             for a, b in matchups:
                 key = tuple(sorted([a, b]))
                 matchup_counts[ri][key] += 1
@@ -348,11 +351,12 @@ def main() -> None:
     print("\n" + "=" * 60)
     print("  MOST LIKELY KNOCKOUT MATCHUPS (by round)")
     print("=" * 60)
-    for ri, label in enumerate(round_labels):
-        mc = matchup_counts[ri]
+    for ri, mc in enumerate(matchup_counts):
         if not mc:
             continue
-        top = sorted(mc.items(), key=lambda x: -x[1])[:top_per_round[ri]]
+        label  = round_labels[ri]  if ri < len(round_labels)  else f"Round {ri + 1}"
+        n_show = top_per_round[ri] if ri < len(top_per_round) else 4
+        top = sorted(mc.items(), key=lambda x: -x[1])[:n_show]
         print(f"\n  {label}:")
         for (a, b), cnt in top:
             print(f"    {a:<26} vs  {b:<26}  {cnt/n*100:5.1f}%")
