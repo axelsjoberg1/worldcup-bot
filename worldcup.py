@@ -187,6 +187,21 @@ def _norm_team(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip().lower()
 
 
+def _drop_nonmonotonic_over(items: list[tuple[float, float]], tol: float = 0.05) -> list[tuple[float, float]]:
+    """Filter Over/Under lines (sorted ascending by line) so the Over price never
+    increases with the line. Untraded high goal lines default to 0.50 on
+    Polymarket; left in, they would distort the Poisson fit upward. Over(line)
+    must be non-increasing, so any line jumping back above the running minimum
+    (beyond a small noise tolerance) is dropped."""
+    kept: list[tuple[float, float]] = []
+    ceil: float | None = None
+    for line, p in items:
+        if ceil is None or p <= ceil + tol:
+            kept.append((line, p))
+            ceil = p if ceil is None else min(ceil, p)
+    return kept
+
+
 def parse_goals_markets(
     goals_markets: list[dict], home_team: str = "", away_team: str = ""
 ) -> dict:
@@ -247,9 +262,9 @@ def parse_goals_markets(
                 liquidity += vol
 
     return {
-        "total": sorted(total.items()),
-        "home":  sorted(home.items()),
-        "away":  sorted(away.items()),
+        "total": _drop_nonmonotonic_over(sorted(total.items())),
+        "home":  _drop_nonmonotonic_over(sorted(home.items())),
+        "away":  _drop_nonmonotonic_over(sorted(away.items())),
         "btts":  btts,
         "liquidity": liquidity,
     }
