@@ -57,6 +57,7 @@ from worldcup import (
     get_winner_probs,
     get_score_predictions,
 )
+from worldcup_top3 import finishing_probs, best_podium
 
 # Knockout rounds start here for WC 2026 (Round of 32). Matches before this are
 # group stage and are ignored by this tool.
@@ -393,18 +394,47 @@ def explain_match(p: dict) -> None:
 
 # ── PDF report ────────────────────────────────────────────────────────────────
 
-def generate_pdf(picks: list[dict], output_path: str) -> None:
+def generate_pdf(picks: list[dict], output_path: str, top3: tuple | None = None) -> None:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import mm
+    from reportlab.lib import colors
     from reportlab.platypus import (
         SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable,
     )
     from worldcup_pdf import (
-        build_styles, fmt_liq,
+        build_styles, fmt_liq, GOLD,
         GREEN, LIGHT_GREEN, GREEN_BORDER, LIGHT_ORANGE, ORANGE_BORDER, MID_GREY,
     )
 
     styles = build_styles()
+
+    def top3_card() -> Table:
+        (combo, ev), gold, silver, bronze, tname = top3
+        medals = [
+            ("GOLD",   combo[0], gold,   10, "#c8a400"),
+            ("SILVER", combo[1], silver,  8, "#8a8d91"),
+            ("BRONZE", combo[2], bronze,  6, "#b35c00"),
+        ]
+        cells = [Paragraph(
+            f'<b>VM TOPP 3</b>&nbsp;&nbsp;<font size="8" color="#777777">'
+            f'EV-optimal podium · scored 10 / 8 / 6 · expected {ev:.2f}p</font>',
+            styles["match_title"])]
+        for label, t, probs, pts, col in medals:
+            cells.append(Paragraph(
+                f'<font color="{col}"><b>{label}</b></font>&nbsp;&nbsp; '
+                f'<b>{tname[t]}</b>&nbsp; '
+                f'<font size="8" color="#777777">{probs[t]*100:.1f}% · '
+                f'{pts} × {probs[t]*100:.0f}% = {pts*probs[t]:.2f}p</font>',
+                styles["score_others"]))
+        tbl = Table([[c] for c in cells], colWidths=[176 * mm])
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#fbf7e6")),
+            ("ROUNDEDCORNERS", [4]),
+            ("BOX", (0, 0), (-1, -1), 0.6, GOLD),
+            ("LEFTPADDING", (0, 0), (-1, -1), 9), ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+            ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        return tbl
 
     def card(p: dict) -> Table:
         left = [Paragraph(
@@ -519,7 +549,11 @@ def generate_pdf(picks: list[dict], output_path: str) -> None:
         f"Polymarket predictions · {datetime.now().strftime('%Y-%m-%d %H:%M')} · "
         "tip = 90-min exact score + team to advance",
         styles["subtitle"]))
-    story.append(Spacer(1, 6 * mm))
+    story.append(Spacer(1, 4 * mm))
+
+    if top3 is not None:
+        story.append(top3_card())
+        story.append(Spacer(1, 4 * mm))
 
     for p in picks:
         story.append(card(p))
@@ -565,6 +599,21 @@ def main() -> None:
         print("  To test the pipeline on current matches: --from 2026-06-01")
         return
 
+    # Podium (top-3) for the PDF header + console summary; skipped if the
+    # tournament futures markets aren't available.
+    top3 = None
+    try:
+        gold, silver, bronze, tname = finishing_probs(events)
+        combo, ev = best_podium(gold, silver, bronze)
+        top3 = ((combo, ev), gold, silver, bronze, tname)
+        labels = [("GOLD  ", 10, gold), ("SILVER", 8, silver), ("BRONZE", 6, bronze)]
+        print("  VM TOP 3 (10/8/6) — EV-optimal podium:")
+        for (lab, pts, pr), t in zip(labels, combo):
+            print(f"     {lab}: {tname[t]:<22} {pr[t]*100:5.1f}%  -> {pts*pr[t]:.2f}p")
+        print(f"     expected total {ev:.2f}p")
+    except SystemExit:
+        print("  (top-3 podium skipped — tournament futures markets not found)")
+
     print("-" * 62)
     picks = [knockout_pick(e) for e in matches]
     if args.explain is not None:
@@ -578,7 +627,7 @@ def main() -> None:
             print_ko_match(p)
 
     print("\n" + "=" * 62)
-    generate_pdf(picks, args.out)
+    generate_pdf(picks, args.out, top3)
     print("=" * 62)
 
 
